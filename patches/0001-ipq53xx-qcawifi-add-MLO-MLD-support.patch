@@ -1,0 +1,127 @@
+--- a/target/linux/ipq53xx/ipq53xx_32/base-files/lib/netifd/wireless/qcawifi.sh
++++ b/target/linux/ipq53xx/ipq53xx_32/base-files/lib/netifd/wireless/qcawifi.sh
+@@ -66,6 +66,7 @@
+ 	local macaddr="$4"
+ 	local target_mode="$5"
+ 	local channel="$6"
++	local mld_mac="$7"
+ 
+ 	[ -d "/sys/class/net/${ifname}" ] && return 0
+ 
+@@ -112,7 +113,14 @@
+ 	wlanconfig "$ifname" create wlandev "$wlandev" wlanmode "$pmode" $bssid_opt 2>/dev/null || true
+ 
+ 	# 2. Bind nl80211 netdev
+-	iw phy "$phy" interface add "$ifname" type "$wlanmode" 2>/dev/null || true
++	# MLO: если задан mld_mac — создаём link-VDEV внутри MLD.
++	# Драйвер QSDK по mld_addr находит MLD-контекст и регистрирует link.
++	if [ -n "$mld_mac" ]; then
++		iw phy "$phy" interface add "$ifname" type "$wlanmode" mld_addr "$mld_mac" 2>/dev/null || \
++		iw phy "$phy" interface add "$ifname" type "$wlanmode" 2>/dev/null || true
++	else
++		iw phy "$phy" interface add "$ifname" type "$wlanmode" 2>/dev/null || true
++	fi
+ 
+ 	[ -n "$macaddr" ] && ip link set "$ifname" address "$macaddr" 2>/dev/null || true
+ 
+@@ -141,11 +149,39 @@
+ 	fi
+ }
+ 
++ensure_mld_netdev() {
++	# Создаёт MLD-интерфейс (bond) один раз, на mld-phy из sysfs.
++	local mld_mac="$1"
++	local mld_name="${2:-hostap_mld0}"
++	local bridge="$3"
++
++	[ -n "$mld_mac" ] || return 0
++	[ -d "/sys/class/net/${mld_name}" ] && return 0
++
++	local mld_phy=""
++	[ -f /sys/class/net/wifi0/mldphy_name ] && mld_phy=$(cat /sys/class/net/wifi0/mldphy_name 2>/dev/null)
++	[ -z "$mld_phy" ] && return 0
++
++	iw phy "$mld_phy" interface add "$mld_name" type __ap mld_addr "$mld_mac" 2>/dev/null || return 0
++	sleep 1
++	ip link set "$mld_name" up 2>/dev/null || true
++
++	[ -z "$bridge" ] && bridge="br-lan"
++	if [ -d "/sys/class/net/${bridge}" ]; then
++		brctl addif "$bridge" "$mld_name" 2>/dev/null || true
++	fi
++
++	logger -t mac80211 "MLO: created $mld_name ($mld_mac) on $mld_phy -> $bridge"
++}
++
+ restart_hostapd_instance() {
+ 	local ifname="$1"
+ 	local bridge="$2"
+ 	local target_mode="$3"
+ 	local channel="$4"
++	local mld_mac="$5"
++	local mld_link_macs="$6"
++	local mld_link_ids="$7"
+ 	local conf="/var/run/hostapd-${ifname}.conf"
+ 	local active="/var/run/hostapd-${ifname}.conf.active"
+ 	local pid_file="/var/run/hostapd-${ifname}.pid"
+@@ -205,8 +241,9 @@
+ 	rm -f "$pid_file" "$sock_file" "$active"
+ 	mkdir -p /var/run/hostapd
+ 
+-	# Ensure bridge association and link state
+-	if [ -n "$bridge" ] && [ -d "/sys/class/net/${bridge}" ]; then
++	# MLO: link-VDEV не добавляются в bridge — там живёт только MLD.
++	# Иначе драйвер не находит MLD-контекст (mlo_ap_get_bridge_vdev_list: Invalid input).
++	if [ -n "$bridge" ] && [ -d "/sys/class/net/${bridge}" ] && [ -z "$mld_mac" ]; then
+ 		brctl addif "$bridge" "$ifname" 2>/dev/null || true
+ 	fi
+ 	# Ensure interface is down before hostapd initializes driver mode
+@@ -215,6 +252,15 @@
+ 	# Set physical driver hardware mode (bandwidth/protocol)
+ 	if [ -n "$target_mode" ] && [ -x /usr/sbin/cfg80211tool ]; then
+ 		/usr/sbin/cfg80211tool "$ifname" mode "$target_mode" 2>/dev/null || true
++	fi
++
++	# MLO: дописываем mld-параметры в конфиг hostapd
++	if [ -n "$mld_mac" ] && ! grep -q "^mld_mac_addr=" "$conf" 2>/dev/null; then
++		{
++			echo "mld_mac_addr=$mld_mac"
++			echo "mld_link_macs=$mld_link_macs"
++			echo "mld_link_ids=$mld_link_ids"
++		} >> "$conf"
+ 	fi
+ 
+ 	# Start fresh hostapd daemon
+@@ -366,7 +412,7 @@
+ 
+ 	json_get_var network_bridge bridge
+ 	json_select config
+-	json_get_vars ifname mode network disabled ssid encryption key wds isolate hidden bssid wps_pushbutton macaddr extap txpower
++	json_get_vars ifname mode network disabled ssid encryption key wds isolate hidden bssid wps_pushbutton macaddr extap txpower mld mld_mac mld_link_macs mld_link_ids
+ 	json_select ..
+ 
+ 	[ -z "$mode" ] && mode="ap"
+@@ -439,8 +485,13 @@
+ 	local target_mode=""
+ 	[ "$mode" = "ap" ] || [ "$mode" = "ap-wds" ] && target_mode=$(get_target_hwmode "$__netifd_device" "$ifname")
+ 
++	# MLO: MLD-интерфейс должен существовать до создания link-VDEV
++	if [ -n "$mld_mac" ]; then
++		ensure_mld_netdev "$mld_mac" "hostap_mld0" "$network_bridge"
++	fi
++
+ 	# Ensure kernel VAP exists
+-	ensure_vap_netdev "$__netifd_device" "$ifname" "$mode" "$macaddr" "$target_mode" "$channel"
++	ensure_vap_netdev "$__netifd_device" "$ifname" "$mode" "$macaddr" "$target_mode" "$channel" "$mld_mac"
+ 
+ 	if [ "$mode" = "sta" ] || [ "$mode" = "sta-wds" ]; then
+ 		local br=""
+@@ -476,7 +527,7 @@
+ 				br="${network}"
+ 			fi
+ 		fi
+-		restart_hostapd_instance "$ifname" "$br" "$target_mode" "$channel"
++		restart_hostapd_instance "$ifname" "$br" "$target_mode" "$channel" "$mld_mac" "$mld_link_macs" "$mld_link_ids"
+ 	fi
+ 
+ 	mac80211_apply_txpower "$__netifd_device" "$ifname" "$txpower"
