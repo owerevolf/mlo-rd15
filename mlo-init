@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/mlo
+# Поднимает MLO после старта Wi-Fi.
+# Управление: /etc/init.d/mlo start|stop|status
+
+START=99
+STOP=05
+USE_PROCD=0
+
+SCRIPT="/usr/sbin/mlo-up"
+LOG="/tmp/mlo.log"
+
+start() {
+    [ -x "$SCRIPT" ] || return 1
+    # в фоне, чтобы не задерживать загрузку
+    ( "$SCRIPT" ) &
+    echo "mlo-up запущен в фоне, лог: $LOG"
+}
+
+stop() {
+    killall mlo-up 2>/dev/null
+    echo "mlo-up остановлен"
+}
+
+status() {
+    if ps w | grep -q "[m]lo-up"; then
+        echo "mlo-up: работает"
+    else
+        echo "mlo-up: не запущен"
+    fi
+    if dmesg | grep -q "mlo_ap_vdev_attach"; then
+        echo "MLO: активен"
+        dmesg | grep "mlo_ap_vdev_attach" | tail -2
+    else
+        echo "MLO: не активен"
+    fi
+}
