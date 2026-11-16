@@ -1,0 +1,91 @@
+#!/bin/sh
+# /root/mlo-up — поднимает MLO по схеме стоковой прошивки (QSDK 12.5, RD15)
+
+MLD_SEC="mld0"
+BR="br-lan"
+IWL="/root/iw_mld"
+LOG="/tmp/mlo.log"
+WAIT=60
+
+log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }
+
+log "=== старт ==="
+
+[ -x "$IWL" ] || { log "нет $IWL"; exit 1; }
+
+# ждём netifd
+i=0
+while [ $i -lt $WAIT ]; do
+    [ -f /var/run/hostapd-ath0.conf ] && break
+    sleep 2
+    i=$((i + 2))
+done
+[ -f /var/run/hostapd-ath0.conf ] || { log "нет конфигов netifd"; exit 1; }
+log "конфиги готовы"
+
+MLD_MAC=$(uci -q get wireless.$MLD_SEC.mld_macaddr)
+[ -n "$MLD_MAC" ] || { log "нет mld_macaddr в UCI"; exit 1; }
+
+MAC_24=$(cat /sys/class/net/wifi0/address 2>/dev/null)
+MAC_5=$(cat /sys/class/net/wifi1/address 2>/dev/null)
+PHY_24=$(cat /sys/class/net/wifi0/phy80211/name 2>/dev/null)
+PHY_5=$(cat /sys/class/net/wifi1/phy80211/name 2>/dev/null)
+MLD_PHY=$(cat /sys/class/net/wifi0/mldphy_name 2>/dev/null)
+[ -n "$PHY_24" ] && [ -n "$PHY_5" ] && [ -n "$MLD_PHY" ] || { log "phy не определены"; exit 1; }
+log "MLD=$MLD_MAC phy24=$PHY_24 phy5=$PHY_5 mld=$MLD_PHY"
+
+# конфиги только для двух линков
+cp /var/run/hostapd-ath0.conf /tmp/mlo_h0.conf
+cp /var/run/hostapd-ath1.conf /tmp/mlo_h1.conf
+for f in /tmp/mlo_h0.conf /tmp/mlo_h1.conf; do
+    grep -q "^mld_mac_addr=" "$f" || {
+        echo "mld_mac_addr=$MLD_MAC" >> "$f"
+        echo "mld_link_macs=$MAC_5 $MAC_24" >> "$f"
+        echo "mld_link_ids=1 0" >> "$f"
+    }
+done
+log "mld_* добавлены"
+
+# пересоздаём линки
+killall hostapd 2>/dev/null
+sleep 1
+$IWL dev ath0 del 2>/dev/null
+$IWL dev ath1 del 2>/dev/null
+sleep 1
+
+$IWL phy "$MLD_PHY" interface add hostap_mld0 type __ap mld_addr "$MLD_MAC" 2>>"$LOG"
+sleep 1
+ip link set hostap_mld0 up 2>/dev/null
+brctl addif "$BR" hostap_mld0 2>/dev/null
+
+$IWL phy "$PHY_24" interface add ath0 type __ap mld_addr "$MLD_MAC" 2>>"$LOG"
+$IWL phy "$PHY_5"  interface add ath1 type __ap mld_addr "$MLD_MAC" 2>>"$LOG"
+sleep 2
+
+GOT=$($IWL dev ath0 info 2>/dev/null | grep "mld_addr" | awk '{print $2}')
+log "mld_addr=$GOT"
+if [ "$GOT" != "$MLD_MAC" ]; then
+    log "ОТКАЗ: mld_addr не тот — откат"
+    killall hostapd 2>/dev/null
+    for d in ath0 ath1 hostap_mld0; do $IWL dev "$d" del 2>/dev/null; done
+    wifi up >/dev/null 2>&1
+    exit 1
+fi
+
+hostapd -B /tmp/mlo_h0.conf /tmp/mlo_h1.conf 2>>"$LOG"
+sleep 8
+
+HD=$(ps w | grep -c '[h]ostapd')
+SS=$($IWL dev 2>/dev/null | grep -c ssid)
+log "hostapd=$HD ssid=$SS"
+
+if [ "$HD" -eq 0 ] || [ "$SS" -eq 0 ]; then
+    log "ОТКАЗ: не поднялось — откат"
+    killall hostapd 2>/dev/null
+    for d in ath0 ath1 hostap_mld0; do $IWL dev "$d" del 2>/dev/null; done
+    wifi up >/dev/null 2>&1
+    exit 1
+fi
+
+dmesg | grep -q "mlo_ap_vdev_attach" && log "MLO активен" || log "ВНИМАНИЕ: attach не найден"
+log "=== готово ==="
