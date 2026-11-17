@@ -57,6 +57,27 @@ EOF
 fi
 info "UCI-секция mld0 есть: $(uci -q get wireless.mld0.mld_macaddr)"
 
+# --- Совместимость: PMF не должен быть обязательным ---
+# При ieee80211w=2 (обязательный PMF) старые устройства — телевизоры,
+# умные колонки, роботы-пылесосы — молча не проходят ассоциацию.
+# Для MLO достаточно ieee80211w=1 (опциональный).
+NEED_COMMIT=0
+for r in default_radio0 default_radio1; do
+    [ -n "$(uci -q get wireless.$r)" ] || continue
+    cur_pmf=$(uci -q get wireless.$r.ieee80211w)
+    if [ "$cur_pmf" = "2" ]; then
+        warn "$r: ieee80211w=2 (обязательный PMF) — старые устройства не подключатся"
+        uci set wireless.$r.ieee80211w='1'
+        NEED_COMMIT=1
+    fi
+done
+if [ "$NEED_COMMIT" = "1" ]; then
+    uci commit wireless
+    info "PMF переключён на опциональный (ieee80211w=1)"
+else
+    info "PMF уже опциональный или не задан — ок"
+fi
+
 # флеш-память
 FREE=$(df -k /overlay | awk 'NR==2 {print $4}')
 if [ "$FREE" -lt 2000 ]; then
